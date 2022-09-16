@@ -15,14 +15,13 @@
  * Author: David Ha <hadavid@google.com>
  *
  * @fileoverview Basic p5.js sketch to show how to use sketch-rnn
- * to predict 9 different possible endings for an incomplete sketch.
+ * to auto-encode the user's sketch 9 times.
  */
 
 var sketch = function( p ) { 
   "use strict";
 
-  var small_class_list = ['bird',
-    'ant',
+  var small_class_list = ['ant',
     'antyoga',
     'alarm_clock',
     'ambulance',
@@ -34,6 +33,7 @@ var sketch = function( p ) {
     'bee',
     'beeflower',
     'bicycle',
+    'bird',
     'book',
     'brain',
     'bridge',
@@ -148,7 +148,6 @@ var sketch = function( p ) {
     'bee',
     'beeflower',
     'bicycle',
-    'bird',
     'book',
     'brain',
     'bridge',
@@ -174,7 +173,6 @@ var sketch = function( p ) {
     'duck',
     'elephant',
     'elephantpig',
-    'everything',
     'eye',
     'face',
     'fan',
@@ -275,6 +273,7 @@ var sketch = function( p ) {
   var start_x, start_y;
   var has_started = false; // set to true after user starts writing.
   var just_finished_line = false;
+  var start_vae = false;
   var epsilon = 2; // to ignore data from user's pen staying in one spot.
   var screen_width, screen_height; // stores the browser's dimensions
   var raw_lines;
@@ -283,7 +282,7 @@ var sketch = function( p ) {
   var strokes, raw_strokes;
   var stroke, raw_stroke;
   var last_point, idx;
-  var line_color, raw_line_color, predict_line_color;
+  var line_color, raw_line_color;
 
   // model related
   var model, model_data;
@@ -299,7 +298,7 @@ var sketch = function( p ) {
 
   // individual models (2d arrays)
   var model_state;
-  var model_x, model_y;
+  var model_x, model_y, model_z;
   var model_dx, model_dy;
   var model_is_active;
   var model_steps;
@@ -308,23 +307,23 @@ var sketch = function( p ) {
   // dom
   var canvas;
   var reset_button;
-  var model_sel; // , vae_sel
+  var model_sel;
   var temperature_slider;
   var text_instruction;
+  var text_model_info;
   var text_temperature;
   var random_model_button;
-  var predict_button;
+  var vae_button;
   var text_title;
-  var title_text = "sketch-rnn predictor.";
+  var title_text = "sketch-rnn variational auto-encoder.";
 
   var print = function(x) {
     console.log(x);
   };
 
   var set_title_text = function(new_text) {
-    title_text = new_text.split('_').join(' ');
-    text_title.html(title_text);
-  }
+    text_title.html(new_text.split('_').join(' '));
+  };
 
   var Create2DArray = function(rows, cols) {
     var arr = [];
@@ -334,14 +333,14 @@ var sketch = function( p ) {
     }
 
     return arr;
-  }
+  };
 
   var draw_example = function(example, start_x, start_y, line_color, line_thickness) {
     var i;
     var x=start_x, y=start_y;
     var x, y;
     var pen_down, pen_up, pen_end;
-    var prev_pen = [0, 0, 0];   
+    var prev_pen = [1, 0, 0];   
     var the_line_thickness = 1.0;
 
     if (typeof line_thickness === "number") {
@@ -360,7 +359,7 @@ var sketch = function( p ) {
       if (prev_pen[0] == 1) {
         p.stroke(line_color);
         p.strokeWeight(the_line_thickness);
-        p.line(x, y, (x+dx), (y+dy)); // draw line connecting prev point to current point.
+        p.line(x, y, x+dx, y+dy); // draw line connecting prev point to current point.
       }
 
       // update the absolute coordinates from the offsets
@@ -385,11 +384,10 @@ var sketch = function( p ) {
 
     ModelImporter.set_init_model(model_raw_data);
     if (use_large_models) {
-      ModelImporter.set_model_url("https://storage.googleapis.com/quickdraw-models/sketchRNN/large_models/");      
+      ModelImporter.set_model_url("https://storage.googleapis.com/quickdraw-models/sketchRNN/large_models/");
     }
 
     model_data = ModelImporter.get_model_data();
-
     model = new SketchRNN(model_data);
     model.set_pixel_factor(screen_scale_factor);
 
@@ -405,7 +403,7 @@ var sketch = function( p ) {
     model_y =  Create2DArray(Nsize, Nsize);
     model_dx = Create2DArray(Nsize, Nsize);
     model_dy = Create2DArray(Nsize, Nsize);
-
+    model_z =  Create2DArray(Nsize, Nsize); // will be tanh'ed.
     model_is_active = Create2DArray(Nsize, Nsize);
     model_steps = Create2DArray(Nsize, Nsize);
     model_prev_pen = Create2DArray(Nsize, Nsize);
@@ -428,10 +426,10 @@ var sketch = function( p ) {
     random_model_button.position(226, insize-25);
     random_model_button.mousePressed(random_model_button_event); // attach button listener
 
-    // predict button
-    predict_button = p.createButton('predict');
-    predict_button.position(290, insize-25);
-    predict_button.mousePressed(predict_button_event); // attach button listener
+    // vae button
+    vae_button = p.createButton('auto-encode');
+    vae_button.position(290, insize-25);
+    vae_button.mousePressed(vae_button_event); // attach button listener
 
     // temperature
     temperature_slider = p.createSlider(1, 100, temperature*100);
@@ -453,7 +451,7 @@ var sketch = function( p ) {
     text_title = p.createP(title_text);
     text_title.style("font-family", "monospace");
     text_title.style("font-size", "16");
-    text_title.style("color", "#3393d1"); // ff990a
+    text_title.style("color", "#ff990a");
     text_title.position(10, -10);
 
   };
@@ -461,7 +459,7 @@ var sketch = function( p ) {
   var reset_screen_text = function() {
     var class_name = model.name;
     class_name = class_name.split('_').join(' ')
-    text_instruction.html('draw partial '+class_name+'.');
+    text_instruction.html('draw complete '+class_name+'.');
     text_temperature.html("temperature: "+temperature);
   };
 
@@ -483,7 +481,6 @@ var sketch = function( p ) {
     p.stroke(0.25);
     p.strokeWeight(0.25);
     p.rect(1, 1, screen_width-1, screen_width/2-1);
-
     for(i=0;i<Nsize;i++) {
       p.line(screen_width/2+outsize*i-1, 1, screen_width/2+outsize*i-1, screen_width/2);
     }
@@ -499,25 +496,6 @@ var sketch = function( p ) {
       draw_example(raw_strokes, start_x, start_y, raw_line_color, line_width);
     }
 
-    // draw on the model screens
-    var o_x, o_y;
-
-    var scale = Nsize;
-
-    var scaled_strokes = model.scale_drawing_by_factor(raw_strokes, 1.0/scale);
-
-    // individual models:
-    for (i=0;i<Nsize;i++) {
-      for (j=0;j<Nsize;j++) {
-
-        o_x = origin_x[i][j];
-        o_y = origin_y[i][j];
-
-        draw_example(scaled_strokes, o_x+start_x/scale, o_y+start_y/scale, raw_line_color, line_width);
-
-      }
-    }
-
   };
 
   var restart_all_models = function() {
@@ -531,54 +509,40 @@ var sketch = function( p ) {
         model_y[i][j] = 0;
         model_dx[i][j] = 0;
         model_dy[i][j] = 0;
+        model_z[i][j] = null;
         model_is_active[i][j] = false;
         model_steps[i][j] = 0;
-        model_prev_pen[i][j] = [0, 1, 0];
+        model_prev_pen[i][j] = [0, 0, 0];
       }
     }
+
+    // turn off vae by default
+    start_vae = false;
   };
 
-  var encode_all_models = function(sequence) {
-    // encode from beginning of human-generated sequence to present.
+  var encode_all_models = function(sx, sy, sequence) {
     var i, j;
-
+    var mu, sigma;
     if (sequence.length <= min_sequence_length) {
       return;
     }
     var short_sequence = model.copy_drawing(sequence, model.max_seq_length);
 
-    // encode sequence
-    var rnn_state = model.zero_state();
-    rnn_state = model.update(model.zero_input(), rnn_state);
-    for (i=0;i<sequence.length-1;i++) {
-      rnn_state = model.update(sequence[i], rnn_state);
-    }
+    [mu, sigma] = model.encode_to_mu_sigma(short_sequence);
 
     // individual models:
-    var sx = last_point[0];
-    var sy = last_point[1];
-
-    var dx, dy, pen_down, pen_up, pen_end;
-    var s = sequence[sequence.length-1];
 
     for (i=0;i<Nsize;i++) {
       for (j=0;j<Nsize;j++) {
-        model_state[i][j] = model.copy_state(rnn_state); // bounded
-
+        model_z[i][j] = model.encode_from_mu_sigma(mu, sigma);
+        model_state[i][j] = model.get_init_state_from_latent_vector(model_z[i][j]);
         model_x[i][j] = sx;
         model_y[i][j] = sy;
-
-        dx = s[0];
-        dy = s[1];
-        pen_down = s[2];
-        pen_up = s[3];
-        pen_end = s[4];
-
-        model_dx[i][j] = dx;
-        model_dy[i][j] = dy;
+        model_dx[i][j] = 0;
+        model_dy[i][j] = 0;
         model_is_active[i][j] = true;
         model_steps[i][j] = 0;
-        model_prev_pen[i][j] = [pen_down, pen_up, pen_end];
+        model_prev_pen[i][j] = [0, 0, 0];
       }
     }
 
@@ -602,6 +566,7 @@ var sketch = function( p ) {
     var o_x, o_y;
 
     var scale = Nsize;
+    var fudge = 0;
 
     // individual models:
     for (i=0;i<Nsize;i++) {
@@ -612,8 +577,8 @@ var sketch = function( p ) {
         }
 
         if (model_is_active[i][j]) {
-          o_x = origin_x[i][j];
-          o_y = origin_y[i][j];
+          o_x = origin_x[i][j]+fudge;
+          o_y = origin_y[i][j]+fudge;
           m_x = model_x[i][j];
           m_y = model_y[i][j];
           m_dx = model_dx[i][j];
@@ -621,13 +586,13 @@ var sketch = function( p ) {
           m_pen_down = model_prev_pen[i][j][0];
           m_pen_up = model_prev_pen[i][j][1];
           m_pen_end = model_prev_pen[i][j][2];
-          model_state[i][j] = model.update([m_dx, m_dy, m_pen_down, m_pen_up, m_pen_end], model_state[i][j]);
+          model_state[i][j] = model.update([m_dx, m_dy, m_pen_down, m_pen_up, m_pen_end], model_state[i][j], model_z[i][j]);
           model_steps[i][j] += 1;
           pdf = model.get_pdf(model_state[i][j]);
           [m_dx, m_dy, m_pen_down, m_pen_up, m_pen_end] = model.sample(pdf, temperature, 0.5+0.5*temperature);
           if (m_pen_end === 1) {
             model_is_active[i][j] = false;
-            if (async_draw) {
+            if (!async_draw) {
               continue;
             } else {
               return;  
@@ -641,7 +606,7 @@ var sketch = function( p ) {
             x1 = (m_x+m_dx)/scale;
             y1 = (m_y+m_dy)/scale;
             if (inside_box(x0, y0) && inside_box(x1, y1)) {
-              p.stroke(predict_line_color);
+              p.stroke(raw_line_color);
               p.strokeWeight(line_width);
               p.line(o_x+x0, o_y+y0, o_x+x1, o_y+y1);
             }
@@ -664,39 +629,6 @@ var sketch = function( p ) {
 
   };
 
-  var draw_user_strokes = function(x, y, dx, dy) {
-
-    // draw on large main screen
-    p.stroke(raw_line_color);
-    p.strokeWeight(line_width); // nice thick line
-    p.line(x, y, x+dx, y+dy); // draw line connecting prev point to current point.
-
-    // draw on the model screens
-    var i, j;
-    var o_x, o_y, x0, y0, x1, y1;
-
-    var scale = Nsize;
-
-    // individual models:
-    for (i=0;i<Nsize;i++) {
-      for (j=0;j<Nsize;j++) {
-
-        o_x = origin_x[i][j];
-        o_y = origin_y[i][j];
-
-        x0 = x/scale;
-        y0 = y/scale;
-        x1 = (x+dx)/scale;
-        y1 = (y+dy)/scale;
-
-        p.stroke(raw_line_color);
-        p.strokeWeight(line_width);
-        p.line(o_x+x0, o_y+y0, o_x+x1, o_y+y1);
-
-      }
-    }
-  };
-
   var restart = function() {
 
     restart_all_models();
@@ -707,12 +639,7 @@ var sketch = function( p ) {
     var g = p.random(64, 224);
     var b = p.random(64, 224);
     line_color = p.color(r, g, b, 64);
-    raw_line_color = p.color(r, g, b, 255);; // p.color(p.random(64, 224), p.random(64, 224), p.random(64, 224));
-    r = p.random(64, 224);
-    g = p.random(64, 224);
-    b = p.random(64, 224);
-    predict_line_color = p.color(r, g, b, 255);
-
+    raw_line_color = p.color(r, g, b, 255);;
     x = insize/2.0;
     y = insize/2.0;
     has_started = false;
@@ -723,7 +650,7 @@ var sketch = function( p ) {
     current_raw_line = [];
 
     redraw_screen();
-  }
+  };
 
   p.setup = function() {
     init();
@@ -742,9 +669,6 @@ var sketch = function( p ) {
         pen = 0;
         current_raw_line.push([x, y]);
       } else {
-        if (pen == 1) {
-          redraw_screen();
-        }
         var dx0 = p.mouseX-x; // candidate for dx
         var dy0 = p.mouseY-y; // candidate for dy
         if (dx0*dx0+dy0*dy0 > epsilon*epsilon) { // only if pen is not in same area
@@ -752,7 +676,9 @@ var sketch = function( p ) {
           dy = dy0;
           pen = 0;
           if (prev_pen == 0) {
-            draw_user_strokes(x, y, dx, dy);
+            p.stroke(raw_line_color);
+            p.strokeWeight(line_width); // nice thick line
+            p.line(x, y, x+dx, y+dy); // draw line connecting prev point to current point.
           }
 
           // update the absolute coordinates from the offsets
@@ -788,11 +714,9 @@ var sketch = function( p ) {
           strokes = strokes.concat(stroke);
           redraw_screen();
 
-          // rock it!
-          idx = raw_lines.length-1;
-          last_point = raw_lines[idx][raw_lines[idx].length-1];
+          // stop it!
+          restart_all_models();
 
-          encode_all_models(strokes)
         } else {
           if (raw_lines.length === 0) {
             has_started = false;
@@ -832,28 +756,29 @@ var sketch = function( p ) {
 
   var temperature_slider_event = function() {
     temperature = temperature_slider.value()/100;
+    start_vae = true;
     redraw_screen();
     restart_all_models();
-    encode_all_models(strokes);
+    encode_all_models(start_x, start_y, strokes);
   };
 
-  var predict_button_event = function() {
+  var vae_button_event = function() {
+    start_vae = true;
     redraw_screen();
     restart_all_models();
-    encode_all_models(strokes);
+    encode_all_models(start_x, start_y, strokes);
   };
 
   var model_sel_event = function() {
     var c = model_sel.value();
-    // var v = vae_sel.value();
-    var v = "gen";
+    var v = "vae";
     var call_back = function(new_model) {
       model = new_model;
       model.set_pixel_factor(screen_scale_factor);
       redraw_screen();
       restart_all_models();
-      encode_all_models(strokes);
-      set_title_text('sketch-rnn '+model.info.name+' predictor.');
+      encode_all_models(start_x, start_y, strokes);
+      set_title_text('sketch-rnn '+model.info.name+' auto-encoder.');
       var large_model_mode = false;
       async_draw = true;
       if (model.zero_state()[0].size > 512) {
@@ -861,7 +786,7 @@ var sketch = function( p ) {
         async_draw = false;
       }
     }
-    set_title_text('loading model '+c+'...<br/><br/><br/>input disabled.');
+    set_title_text('loading '+c+' model...<br/><br/><br/>input disabled.');
     ModelImporter.change_model(model, c, v, call_back);
   };
 
